@@ -1,0 +1,717 @@
+```{r}
+#train<- read_csv("D:/google downloads/ga-customer-revenue-prediction/train_v2.csv")
+#test <- read_csv("D:/google downloads/ga-customer-revenue-prediction/test_v2.csv")
+#memory.limit(size=60000)
+#set.seed(1)
+#tr <- sample_frac(train,0.01)
+#te <- sample_frac(test,0.01)
+#write.csv(tr, file = 'tr.csv')
+#write.csv(te, file = 'te.csv')
+
+```
+
+```{r echo=FALSE}
+library(tidyverse)
+library(data.table)
+library(ggalluvial)
+library(caret)
+library(lme4)
+library(xgboost)
+library(jsonlite)
+library(lubridate)
+library(knitr)
+library(Rmisc)
+library(scales)
+library(countrycode)
+library(highcharter)
+library(glmnet)
+library(keras)
+library(zoo)
+library(magrittr)
+library(dplyr)
+library(stringr)
+library(gbm)
+library(reshape)
+library(ggridges)
+library(plotmo)
+library(randomForest)
+
+
+```
+section A
+Exploratory data analysis:
+(a)The goals of the Kaggle challenge:
+In this competition, we're supposed to analyze a Google Merchandise Store customer dataset to predict  natural log of the sum of all transactions per user. Finally we need to get the root mean squared error of the our prediction, where it is the natural log of the actual summed revenue value plus one.
+
+(b) Basic information about the dataset:
+The original training dataset has 903653 rows and 13 columns. Because of the large size of the data, we randomly sampled 10% as our training dataset. Here're introductions of some columns:
+date - the date on which the user visited the Store;
+channelGrouping - the channel via which the user came to the Store;
+device - the specifications for the device used to access the Store;
+totals - this section contains aggregate values across the session;
+geoNetwork - this section contains information about the geography of the user;
+socialEngagementType - engagement type, either "Socially Engaged" or "Not Socially Engaged";
+trafficSource - this section contains information about the Traffic Source from which the session originated;
+
+From the "glimpse" of training, we can see that six of the columns have the format of JSON. Plenty of important information,including our target variable, are in these columns.We should split them and get much more variables.
+
+For a times search on the internet, we finally decide to use the package "jsonlite" to parse the variables.
+```{r echo=FALSE}
+train <- read_csv("E:/Final/tr10per.csv")
+glimpse(train)
+set.seed(1)
+test <- sample_frac(train,0.1)
+test=sample(nrow(train),size=floor(nrow(train)*.5),replace=FALSE)
+te=train[test,]
+tr=train[-test,]
+```
+
+First, we take a look at the number of different values we have in some simple features. We choose fullVisitorId, channelGrouping, date, socialEngagementType, visitId, visitNumber and visitStartTime.
+"socialEngagementType" only has one value. So we should delete it larter on.
+```{r echo=FALSE}
+tr %>% select(fullVisitorId, channelGrouping, date, socialEngagementType, visitId, 
+              visitNumber, visitStartTime) %>% 
+  map_dfr(n_distinct) %>% 
+  gather() %>% 
+  ggplot(aes(reorder(key, -value), value)) +
+  geom_bar(stat = "identity", fill="steelblue") + 
+  scale_y_log10(breaks = c(5, 50, 250, 500, 1000, 10000, 50000)) +
+  geom_text(aes(label = value), vjust = 1.6, color = "white", size=3.5) +
+  theme_minimal() +
+  labs(x = "features", y = "Number of unique values") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+Then we use the package "jsonlite" to work on the JSON format columns.
+```{r echo=FALSE}
+flatten_json <- . %>% 
+  str_c(., sep = ":",collapse = ",") %>% 
+  str_c("[", ., "]") %>% 
+  fromJSON(flatten = T)
+
+parse <- . %>% 
+  bind_cols(flatten_json(.$device)) %>%
+  bind_cols(flatten_json(.$geoNetwork)) %>% 
+  bind_cols(flatten_json(.$trafficSource)) %>% 
+  bind_cols(flatten_json(.$totals)) %>% 
+  select(-X1,-device,-customDimensions,-hits, -geoNetwork, -trafficSource, -totals)
+```
+
+```{r echo=FALSE}
+tr <- parse(tr)
+te <- parse(te)
+```
+We remove all the columns that have only one value. They're useless to predict our target.
+```{r echo=FALSE}
+fea_uniq_values <- sapply(tr, n_distinct)
+fea_del <- names(fea_uniq_values[fea_uniq_values == 1])
+tr=tr %>% select(-one_of(fea_del))
+te=te %>% select(-one_of(fea_del))
+```
+In the dataset, there're a lot of different types of unavailable numbers. So we mutate all of them as NA.
+```{r echo=FALSE}
+is_na_val <- function(x) x %in% c("not available in demo dataset", "(not provided)",
+                                  "(not set)", "<NA>", "unknown.unknown",  "(none)")
+
+tr=tr %>% mutate_all(funs(ifelse(is_na_val(.), NA, .)))
+te=te %>% mutate_all(funs(ifelse(is_na_val(.), NA, .)))
+```
+This is the plot of the percentages of missing data. About 12 variables have more than 85% missing data.
+```{r echo=FALSE}
+tr %>% summarise_all(funs(sum(is.na(.))/n()*100)) %>% 
+gather(key="feature", value="missing_pct") %>% 
+  ggplot(aes(x=reorder(feature,-missing_pct),y=missing_pct)) +
+  geom_bar(stat="identity", fill="steelblue")+
+  labs(y = "missing %", x = "features") +
+  coord_flip() +
+  theme_minimal()
+```
+We need to convert some vaeiables to their natural representation.
+```{r echo=FALSE}
+tr=tr %>%
+  mutate(date = ymd(date),
+         hits1 = as.integer(hits1),
+         pageviews = as.integer(pageviews),
+         bounces = as.integer(bounces),
+         newVisits = as.integer(newVisits),
+         transactionRevenue = as.numeric(transactionRevenue))
+         
+te=te %>%
+  mutate(date = ymd(date),
+         hits1 = as.integer(hits1),
+         pageviews = as.integer(pageviews),
+         bounces = as.integer(bounces),
+         newVisits = as.integer(newVisits),
+         transactionRevenue = as.numeric(transactionRevenue))
+```
+Here's the summary of our target variable. Since most of the "transactionRevenue" are 0 in the test dataset, we can safely replace NA values with 0.
+```{r echo=FALSE}
+y <- tr$transactionRevenue
+tr$transactionRevenue <- NULL
+summary(y)
+y[is.na(y)] <- 0
+summary(y)
+y1 <- te$transactionRevenue
+y1[is.na(y1)] <- 0
+te$transactionRevenue <- NULL
+```
+
+These are the plot of transaction revenue and its log1p. The target variable has a wide range of values. We will use log-transformed target. Only 2% of all transactions are not zero.
+```{r echo=FALSE}
+p1 <- as_tibble(y) %>% 
+  ggplot(aes(x = log1p(value))) +
+  geom_histogram(bins = 30, fill="steelblue") + 
+  labs(x = "transaction revenue") +
+  theme_minimal()
+
+p2 <- as_tibble(y[y>0]) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill="steelblue") + 
+  labs(x = "non-zero transaction revenue") +
+  theme_minimal()
+
+multiplot(p1, p2, cols = 2)
+
+as_tibble(log1p(y[y>0] / 1e6)) %>% 
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill="steelblue") + 
+  labs(x = "log(non-zero transaction revenue / 1e6)") +
+  theme_minimal()
+```
+
+The figure shows that users who use Affiliates, Social and other channels do not generate revenue. Referral has the highest revenue.
+```{r echo=FALSE}
+tr %>% 
+  bind_cols(as_tibble(y)) %>% 
+  group_by(channelGrouping) %>% 
+  dplyr:::summarise(revenue = sum(value)) %>%
+  ggplot(aes(x = channelGrouping, y = revenue)) +
+  geom_point(color="steelblue", size=2) +
+  theme_minimal() +
+  scale_y_continuous(labels = comma) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+From this plot we can see the relationship between visitnumber and revenue. In general fewer visit number means more total revenue:
+```{r echo=FALSE}
+tr %>% 
+  bind_cols(as_tibble(y)) %>% 
+  group_by(visitNumber) %>% 
+  dplyr:::summarise(revenue = sum(value)) %>%
+  ggplot(aes(x = visitNumber, y = revenue)) +
+  geom_point(color="steelblue", size=0.5) +
+  theme_minimal() +
+  scale_x_continuous(breaks=c(1, 3, 5, 10, 15, 25, 50, 100), limits=c(0, 105))+
+  scale_y_continuous(labels = comma)
+```
+
+Correlations:
+
+For the correlation, we firstly create a model matrix and filter the correlation coefficients which are larger than 0.9. And we can see that there are 32 pairs which have coefficients larger than 0.9. However, most of them are between the dummy variables and it is difficult to us to determine that if we should delete one of them. The pairs between “isMobile” and “isTrueDirect” is 1.0 and they are both not dummy so we should delete one of them in the following sections.
+```{r echo=FALSE}
+m <- tr %>% 
+  mutate(year = year(date),
+         month = month(date),
+         day = day(date),
+         isMobile = ifelse(isMobile, 1L, 0L),
+         isTrueDirect = ifelse(isMobile, 1L, 0L)) %>% 
+  mutate_all(funs(ifelse(is.na(.), 0, .))) %>% 
+  select(-date, -fullVisitorId, -visitId) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate_if(is.factor, fct_lump, prop = 0.01) %>% 
+  model.matrix(~ . - 1, .) %>%cor(y)
+  
+m1 <- cor(m)
+m1 <- abs(m1)
+
+library(reshape2)
+CM <- m1                              
+CM[lower.tri(CM, diag = TRUE)] <- NA          
+m2<-subset(melt(CM, na.rm = TRUE), value > .9) 
+as.matrix(m2)
+
+m2
+
+```
+
+Autoencoders:
+For an autoencoder to work well we have a strong initial assumption: that the distribution of variables for normal transactions is different from the distribution for fraudulent ones. We make some plots to verify this. Variables were transformed to a [0,1] interval for plotting.
+```{r echo=FALSE}
+tr %>%
+  gather(channelGrouping,date,country,fullVisitorId,visitId,visitNumber,visitStartTime,browser,operatingSystem,isMobile,deviceCategory,continent,subContinent,country,region,metro,city,networkDomain,campaign,source,medium,isTrueDirect,keyword,referralPath,adContent,adwordsClickInfo.page,adwordsClickInfo.slot,adwordsClickInfo.gclId,adwordsClickInfo.adNetworkType,adwordsClickInfo.isVideoAd,hits1,pageviews,timeOnSite,newVisits,sessionQualityDim,bounces,transactions,totalTransactionRevenue,key = "var", value = "value") %>%
+  ggplot(aes(y = as.factor(var), 
+           
+             x = percent_rank(value))) +
+  geom_density_ridges()
+```
+
+
+This kind of plot is useful for discovering of multi-feature interactions. The vertical size of each block is proportional to the frequency of the feature. This plot shows high flows from the US and UK desktops with Chrome.
+```{r}
+tr %>% 
+  select(country, networkDomain, browser, deviceCategory, channelGrouping) %>% 
+  mutate(networkDomain = str_split(networkDomain, "\\.") %>% map(~ .x[[length(.x)]]) %>% unlist) %>% 
+  mutate_all(factor) %>% 
+  mutate_all(fct_lump, 4) %>% 
+  bind_cols(tibble(revenue = ifelse(y == 0, "Zero", "Non-zero") %>% factor)) %>% 
+  na.omit() %>% 
+  filter(revenue == "Non-zero") %>% 
+  group_by_all() %>% 
+  count() %>% 
+  ggplot(aes(y = n, 
+             
+axis1 = browser, axis2 = deviceCategory, axis3 =channelGrouping ,   
+             axis4 = country , axis5 = networkDomain)) +
+  geom_alluvium(aes(fill = revenue), width = 1/12,fill="red") +
+  geom_stratum(width = 1/10, fill = "black", color = "white") +
+  geom_label(stat = "stratum", label.strata = TRUE) +
+  theme_minimal() +
+  scale_x_continuous(breaks = 1:5, labels = c("country", "deviceCategory", "browser",
+                                               "channelGrouping", "networkDomain"))
+
+```
+
+
+
+Unsupervised methods:
+As our Kaggle competition’s goal is to predict a continues variable, transaction Revenue, it is meaningless to do the clustering because it will not improve our final regression or other models’ result. What we can do on unsupervised method is dimensional reduction, and we choose PCA to do it. From the result of PCA, we can see that only two PCs can explain over 99% of variance. So, we can just choose the PC1 and PC2.
+Then we want to see the weight of our variables in these two PCs, from the table below we can see that the “timeOnSite”, “pageviews” and” totalTransactionRevenue” have a relatively higher weight in the PC1 and PC2. We may consider to maintain these 3 variables or even give more sights on them in the following model building sections.
+
+
+```{r echo=FALSE}
+
+grp_mean <- function(x, grp) ave(x, grp, FUN = function(x) mean(x, na.rm = TRUE))
+tri <- 1:nrow(tr)
+tr_te <- tr %>%
+  bind_rows(te) %>% 
+  mutate(year = year(date) %>% factor(),
+         wday = wday(date) %>% factor(),
+         hour = hour(as_datetime(visitStartTime)) %>% factor(),
+         isMobile = ifelse(isMobile, 1L, 0L),
+         isTrueDirect = ifelse(isTrueDirect, 1L, 0L),
+         adwordsClickInfo.isVideoAd = ifelse(!adwordsClickInfo.isVideoAd, 0L, 1L)) %>% 
+  select(-date, -fullVisitorId, -visitId, -hits1, -visitStartTime) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(pageviews_mean_vn = grp_mean(pageviews, visitNumber),
+         pageviews_mean_country = grp_mean(pageviews, country),
+         pageviews_mean_city = grp_mean(pageviews, city),
+         pageviews_mean_dom = grp_mean(pageviews, networkDomain),
+         pageviews_mean_ref = grp_mean(pageviews, referralPath))
+  tr_te$totalTransactionRevenue <- as.integer(tr_te$totalTransactionRevenue)
+  tr_te$timeOnSite <- as.integer(tr_te$timeOnSite)
+
+library(dummies)
+
+memory.limit(size=60000)
+
+tr_te2 <- as.data.frame(tr_te)
+
+tr_te2 <- sample_frac(tr_te2)
+
+tr_te2=tr_te2 %>% select(-region,-city,-source,-adwordsClickInfo.gclId,-referralPath,-metro,-wday,-hour,-networkDomain )
+
+tr_te2[is.na(tr_te2)] <- 0
+
+tr_te3 <- dummy.data.frame(tr_te2)
+
+
+
+pca_train <- tr_te3[tri, ]
+pca_test <- tr_te3[-tri, ]
+
+
+
+prin_comp <- prcomp(pca_train)
+
+
+import <- prin_comp$rotation
+import <- abs(import)
+import <- import[,c(1,2)]
+import <- data.frame(import)
+import <- import[order(import$PC1,decreasing = TRUE),]
+head(import)
+
+
+
+biplot(prin_comp, scale = 0)
+
+std_dev <- prin_comp$sdev
+
+pr_var <- std_dev^2
+
+prop_varex <- pr_var/sum(pr_var)
+
+plot(prop_varex, xlab = "Principal Component",
+             ylab = "Proportion of Variance Explained",
+             type = "b")
+
+plot(cumsum(prop_varex), xlab = "Principal Component",
+              ylab = "Cumulative Proportion of Variance Explained",
+              type = "b")
+```
+
+Section B: Fitting Models
+We add some additional variables:pageviews_mean_vn,country,city,dom,ref, which are the group means of pageviews and visitNumber,country,city,networkDomain,referralPath.
+```{r echo=FALSE}
+grp_mean <- function(x, grp) ave(x, grp, FUN = function(x) mean(x, na.rm = TRUE))
+tri <- 1:nrow(tr)
+tr_te <- tr %>%
+  bind_rows(te) %>% 
+  mutate(year = year(date) %>% factor(),
+         wday = wday(date) %>% factor(),
+         hour = hour(as_datetime(visitStartTime)) %>% factor(),
+         isMobile = ifelse(isMobile, 1L, 0L),
+         isTrueDirect = ifelse(isTrueDirect, 1L, 0L),
+         adwordsClickInfo.isVideoAd = ifelse(!adwordsClickInfo.isVideoAd, 0L, 1L)) %>% 
+  select(-date, -fullVisitorId, -visitId, -hits1, -visitStartTime) %>% 
+  mutate_if(is.character, factor) %>% 
+  mutate(pageviews_mean_vn = grp_mean(pageviews, visitNumber),
+         pageviews_mean_country = grp_mean(pageviews, country),
+         pageviews_mean_city = grp_mean(pageviews, city),
+         pageviews_mean_dom = grp_mean(pageviews, networkDomain),
+         pageviews_mean_ref = grp_mean(pageviews, referralPath)) %>% 
+  glimpse()
+```
+
+We make some scatter plots of continuous variables and prepare to do some transformations for them. But it's hard to see the obvious pattern or trend. So we might have to some random transformations such as log and sqrt.
+```{r echo=FALSE}
+y_new<- as.vector(rbind(y,y1)) 
+tr_te_mean<- tr_te%>%
+  select(visitNumber,pageviews,timeOnSite,pageviews_mean_vn,pageviews_mean_country,pageviews_mean_city,pageviews_mean_dom,pageviews_mean_ref)%>%
+  mutate(y_new=y_new)
+tr_te_mean=data.frame(tr_te_mean)
+tr_te_mean %>%
+  gather(visitNumber,pageviews,timeOnSite,pageviews_mean_vn,pageviews_mean_country,pageviews_mean_city,pageviews_mean_dom,pageviews_mean_ref, key = "var", value = "value") %>% 
+  ggplot(aes(x = value, y = y_new)) +
+    geom_point() +
+    facet_wrap(~var, scales = "free") +
+    theme_bw()
+```
+Model1: GLMNET
+We replace NA values with zeros and lump rare factor levels.
+```{r echo=FALSE}
+tr_te_ohe <- tr_te %>% 
+  mutate_if(is.factor, fct_explicit_na) %>% 
+  mutate_if(is.numeric, funs(ifelse(is.na(.), 0L, .))) %>% 
+  mutate_if(is.factor, fct_lump, prop = 0.05) %>% 
+  select(-adwordsClickInfo.isVideoAd) %>% 
+  model.matrix(~.-1, .) %>% 
+  scale() %>% 
+  round(4)
+
+X <- tr_te_ohe[tri, ]
+X_test <- tr_te_ohe[-tri, ]
+```
+
+
+```{r echo=FALSE}
+set.seed(123)
+m_glm <- cv.glmnet(X, log1p(y), alpha = 1, family="gaussian", 
+                   type.measure = "mse", nfolds = 5)
+pred_glm_tr <- predict(m_glm, X, s = "lambda.min") %>% c()
+pred_glm <- predict(m_glm, X_test, s = "lambda.min") %>% c()
+sqrt(mean((log1p(y1)-pred_glm)^2))
+```
+
+Parameter alpha=1 indicates lasso.The lowest lambda is 0.2035144. 
+The RMSE=0.1220899 is fairly well. But according to the coefficients, only totalTransactionRevenueOther and transactionsOther are significant, which doesn't make sense. We consider to use other models to interpret the importance of variables.
+```{r echo=FALSE}
+best.lambda <- m_glm$lambda.min
+plot(m_glm$lambda)
+best.lambda
+glmmod <- glmnet(X, log1p(y), alpha=1, lambda = best.lambda, family="gaussian")
+coefs = coef(glmmod)[,1]
+coefs = sort(abs(coefs), decreasing = TRUE)
+head(coefs)
+```
+
+Model2:keras
+The RMSE is 0.2133232, which is kind of bad compared with GLMNET.
+```{r echo=FALSE}
+set.seed(123)
+m_nn <- keras_model_sequential() 
+m_nn %>%
+  layer_dense(units = 256, activation = "relu", input_shape = ncol(X)) %>% 
+  layer_dropout(rate = 0.5) %>% 
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.25) %>%
+  layer_dense(units = 1, activation = "linear")
+
+m_nn %>% compile(loss = "mean_squared_error",
+                 metrics = custom_metric("rmse", function(y_true, y_pred) 
+                   k_sqrt(metric_mean_squared_error(y_true, y_pred))),
+                 optimizer = optimizer_adadelta())
+
+history <- m_nn %>% 
+  fit(X, log1p(y), 
+      epochs = 50, 
+      batch_size = 128, 
+      verbose = 0, 
+      validation_split = 0.2,
+      callbacks = callback_early_stopping(patience = 5))
+pred_nn_tr <- predict(m_nn, X) %>% c()
+pred_nn <- predict(m_nn, X_test) %>% c()
+sqrt(mean((log1p(y1)-pred_nn)^2))
+```
+
+Model3:xgboosting
+```{r echo=FALSE}
+tr_te_xgb <- tr_te %>% 
+  mutate_if(is.character, factor) 
+
+idx <- tr$date < ymd("20170701")
+id <- te[, "fullVisitorId"]
+tri <- 1:nrow(tr)
+```
+step1:
+I fit all variables first. RMSE=0.1199964. We also plot the importance of variables. "transactions","totalTransactionRevenue" and "pageviews" are very important factors. Other factors may have small effect on revenue. We plot 25 of them to fit xgboosting again to see if RMSE can be improved.
+```{r echo=FALSE}
+set.seed(123)
+dtest <- xgb.DMatrix(data = data.matrix(tr_te_xgb[-tri, ]))
+tr_te_xgb <- tr_te_xgb[tri, ]
+dtr <- xgb.DMatrix(data = data.matrix(tr_te_xgb[idx, ]), label = log1p(y[idx]))
+dval <- xgb.DMatrix(data = data.matrix(tr_te_xgb[!idx, ]), label = log1p(y[!idx]))
+dtrain <- xgb.DMatrix(data = data.matrix(tr_te_xgb), label = log1p(y))
+cols <- colnames(tr_te_xgb)
+
+
+set.seed(0)
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 7,
+          min_child_weight = 5,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 2000)
+
+set.seed(0)
+m_xgb <- xgb.train(p, dtr, p$nrounds, list(val = dval), print_every_n = 100, early_stopping_rounds = 100)
+xgb.importance(cols, model = m_xgb) %>% 
+  xgb.plot.importance(top_n = 25)
+
+
+pred_xgb_tr <- predict(m_xgb, dtrain)
+pred_xgb <- predict(m_xgb, dtest) 
+sqrt(mean((log1p(y1)-pred_xgb)^2))
+```
+step2:
+We change the parameters max_depth, min_child_weight and subsample first. The RMSE is now 0.1171491.
+```{r echo=FALSE}
+set.seed(123)
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth =10,
+          min_child_weight =3,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds =1000)
+
+set.seed(0)
+m_xgb <- xgb.train(p, dtr, p$nrounds, list(val = dval), print_every_n = 100, early_stopping_rounds = 100)
+
+pred_xgb_tr_p <- predict(m_xgb, dtrain)
+pred_xgb_p <- predict(m_xgb, dtest) 
+sqrt(mean((log1p(y1)-pred_xgb_p)^2))
+```
+step3:
+Then we select 25 most important factors. RMSE=0.1158011. It improves a little!
+```{r echo=FALSE}
+set.seed(123)
+tr_te_xgb1=tr_te_xgb%>%
+  select(transactions,totalTransactionRevenue,pageviews,country,pageviews_mean_ref,visitNumber,referralPath,newVisits,pageviews_mean_dom,pageviews_mean_city,timeOnSite,hour,region,browser,city, pageviews_mean_vn,wday,isMobile,operatingSystem,continent,subContinent,bounces,medium,metro,deviceCategory)
+
+dtest1 <- xgb.DMatrix(data = data.matrix(tr_te_xgb1[-tri, ]))
+tr_te_xgb1 <- tr_te_xgb1[tri, ]
+dtr1 <- xgb.DMatrix(data = data.matrix(tr_te_xgb1[idx, ]), label = log1p(y[idx]))
+dval1 <- xgb.DMatrix(data = data.matrix(tr_te_xgb1[!idx, ]), label = log1p(y[!idx]))
+dtrain1 <- xgb.DMatrix(data = data.matrix(tr_te_xgb1), label = log1p(y))
+cols <- colnames(tr_te_xgb1)
+
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 10,
+          min_child_weight = 3,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 1000)
+
+set.seed(0)
+m_xgb1 <- xgb.train(p, dtr1, p$nrounds, list(val = dval1), print_every_n = 100, early_stopping_rounds = 100)
+
+pred_xgb_tr1 <- predict(m_xgb1, dtrain1)
+pred_xgb1 <- predict(m_xgb1, dtest1) 
+sqrt(mean((log1p(y1)-pred_xgb1)^2))
+```
+step4:
+Then it's time to make some transfomations on continuous variables (pageviews;visitNumber;pageviews_mean_vn;pageviews_mean_city;pageviews_mean_dom;pageviews_mean_ref) in the final xgboosting. I try log transformations.
+I replace the original variable with its log transformation one by one. The results of RMSE are as follow:
+pageviews:0.1190386
+pageviews & visitNumber:0.1200756
+pageviews & pageviews_mean_vn:0.1170185
+pageviews & pageviews_mean_vn & pageviews_mean_city:0.1202961
+pageviews & pageviews_mean_vn & pageviews_mean_dom:0.1196429
+pageviews & pageviews_mean_vn & pageviews_mean_ref:0.1138189
+We may conclude that make a log transformation on "pageviews & pageviews_mean_vn & pageviews_mean_ref" is good for our prediction.
+The best result of RMSE in xgboosting is 0.1138189.
+```{r echo=FALSE}
+logpv=log(tr_te_xgb$pageviews)
+logvn=log(tr_te_xgb$visitNumber)
+logpmvn=log(tr_te_xgb$pageviews_mean_vn)
+logpmc=log(tr_te_xgb$pageviews_mean_city)
+logpmd=log(tr_te_xgb$pageviews_mean_dom)
+logpmr=log(tr_te_xgb$pageviews_mean_ref)
+```
+
+```{r echo=FALSE}
+set.seed(123)
+tr_te_xgb2=tr_te_xgb1%>%
+  mutate(logpv=logpv,logpmvn=logpmvn,logpmr=logpmr)%>%
+  dplyr::select(-pageviews,-pageviews_mean_vn,-pageviews_mean_ref)
+
+dtest2 <- xgb.DMatrix(data = data.matrix(tr_te_xgb2[-tri, ]))
+tr_te_xgb2 <- tr_te_xgb2[tri, ]
+dtr2 <- xgb.DMatrix(data = data.matrix(tr_te_xgb2[idx, ]), label = log1p(y[idx]))
+dval2 <- xgb.DMatrix(data = data.matrix(tr_te_xgb2[!idx, ]), label = log1p(y[!idx]))
+dtrain2 <- xgb.DMatrix(data = data.matrix(tr_te_xgb2), label = log1p(y))
+cols <- colnames(tr_te_xgb2)
+
+p <- list(objective = "reg:linear",
+          booster = "gbtree",
+          eval_metric = "rmse",
+          nthread = 4,
+          eta = 0.05,
+          max_depth = 10,
+          min_child_weight = 3,
+          gamma = 0,
+          subsample = 0.8,
+          colsample_bytree = 0.7,
+          colsample_bylevel = 0.6,
+          nrounds = 1000)
+
+set.seed(0)
+m_xgb2 <- xgb.train(p, dtr2, p$nrounds, list(val = dval2), print_every_n = 100, early_stopping_rounds = 100)
+
+pred_xgb_tr2 <- predict(m_xgb2, dtrain2)
+pred_xgb2 <- predict(m_xgb2, dtest2) 
+sqrt(mean((log1p(y1)-pred_xgb2)^2))
+```
+
+Model4: Gradient Boosting Machine
+
+Tuning the parameters
+```{r echo=FALSE}
+temp_ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10 )# 10-fold CV)
+
+temp_grid <-  expand.grid(interaction.depth = c(7,8,9), 
+                         n.trees = (3:5)*100, 
+                          shrinkage = 0.1,
+                          n.minobsinnode = 20)
+
+temp_tune <- train(log1p(y)~., data =X2, 
+                  method = "gbm", 
+                   trControl = temp_ctrl, 
+                   verbose = FALSE, 
+                   tuneGrid = temp_grid)
+plot(varImp(temp_tune),top=20)
+```
+
+step1:
+If we choose distribution = "gaussian", n.trees = 400 ann interaction.depth = 8,
+RMSE=0.1172499, which is the best so far. The plot shows some important variables.
+```{r echo=FALSE}
+set.seed(123)
+X1=data.frame(X)
+X1=X1%>%mutate(y=y)
+X_test1=data.frame(X_test)
+model_gbm <-gbm(log1p(y)~., 
+                data =X1,
+                distribution = "gaussian",
+                n.trees = 400,
+                interaction.depth = 8)
+
+gbm_pred <- predict(model_gbm, newdata = X_test1,n.trees=400)
+sqrt(mean((log1p(y1)-gbm_pred)^2))
+summary(model_gbm,cBars =25)
+```
+step2:
+We choose the 27 most significant variabels. The RMSE is 0.1155575.
+```{r echo=FALSE}
+set.seed(123)
+X2=X1%>%
+  select(totalTransactionRevenueOther,transactionsOther,pageviews,visitNumber,pageviews_mean_ref,pageviews_mean_city,pageviews_mean_dom,pageviews_mean_vn,year2017,operatingSystemMacintosh,hourOther,wday2,channelGroupingOrganic.Search,sessionQualityDim.Missing.,channelGroupingDirect,networkDomainOther,operatingSystemWindows,wday4,wday5,wday7,operatingSystemOther,wday6,year2018,isTrueDirect,hour19,wday3,regionOther)
+
+model_gbm2 <-gbm(log1p(y)~., 
+                data =X2,
+                distribution = "gaussian",
+                n.trees = 400,
+                interaction.depth = 8)
+
+gbm_pred2 <- predict(model_gbm2, newdata = X_test1,n.trees=400)
+sqrt(mean((log1p(y1)-gbm_pred2)^2))
+```
+step3:
+Finally, we tune the parameters and choose n.trees = 300,interaction.depth = 7. The RMSE is 0.1138764.
+```{r echo=FALSE}
+set.seed(123)
+model_gbm3 <-gbm(log1p(y)~., 
+                data =X2,
+                distribution = "gaussian",
+                n.trees = 300,
+                interaction.depth = 7)
+
+gbm_pred3 <- predict(model_gbm3, newdata = X_test1,n.trees=300)
+sqrt(mean((log1p(y1)-gbm_pred3)^2))
+```
+
+Model5:Build an ensemble
+The ensemble uses gbm to combine the predictions of my best models. However, I don't see a great improvement.The RMSE is 0.1173008, which doesn't have a big difference from the result of gbm.
+```{r echo=FALSE}
+set.seed(123)
+X_final=cbind(gbm_pred3,gbm_pred2,pred_xgb2,pred_xgb1,pred_xgb_p,pred_xgb,pred_nn,pred_glm)
+X_final=data.frame(X_final)
+Xm=data.frame(X2)
+X_final=Xm%>%
+dplyr::mutate(gbm_pred3=gbm_pred3,gbm_pred2=gbm_pred2,pred_xgb2=pred_xgb2,pred_xgb1=pred_xgb1,pred_xgb_p=pred_xgb_p,pred_xgb=pred_xgb,pred_nn=pred_nn,pred_glm=pred_glm)
+model_gbm_final <-gbm(log1p(y)~., 
+                data =X_final,
+                distribution = "gaussian",
+                n.trees = 300,
+                interaction.depth = 7)
+
+gbm_pred_final <- predict(model_gbm_final, newdata = X_test1,n.trees=300)
+sqrt(mean((log1p(y1)-gbm_pred_final)^2))
+```
+
+ 
+```
+
+sectionC: Discussion
+(a)Summary about our final model:
+Our final model is the ensamble. In nature, it's a gbm model. The variables are the most important 27 features, which we select from the original gbm model, and predictions of other best models, such as xgboosting and glmnet. About the parameters We use `n.trees = 300`, `interaction.depth = 7`, `shrinkage = 0.1` and `n.minobsinnode = 20`.
+The result of RMSE is around 0.115, which is fairly well. But we don't see a big difference from the results of gmb and xgboosting models.
+
+(b)About future work:
+May be we can also see how target variable changes over time. I think ARIMA model in time series is very powerful to predict the revenue if it truely has some trend in time.
+We might be able to use like 
+
+(c)Hurdles and problems:
+In the data cleaning process, we fail to solve the format of two variables. They have similar format as JSON but can't be seperated by using "jsonlite" or "rjson" package.
+When use "select" and "summarise" in package dplyr, sometimes it doesn't work correctly. I don't know why but when I use "dplyr:::" and "dplyr:", the problem is solved.
+When fitting the random forest model, it takes a long time to run the "Tuning parameters" code and knit. Although we write the code of tuning parameters in "caret", sometimes we have to change one or two parameters by hand.
+When we use PCA to do dimension reduction, it's hard to interpret the importance of variables because of the large amount of factors and dummy variables. So we use the sorted rotation scores to choose important factors.
+
